@@ -110,24 +110,10 @@ decl_module! {
             Ok(())
         }
 
-        // this is for revoking the anchor not any one of the leafs and directly tied to
-        // the origin account at create time. Note: for (on-chain) merkle tree aggregation
-        // we don't allow "root" revocation.
-        pub fn is_revokable(origin, anchor: Vec<u8>) -> DispatchResult {
-            // let sender = ensure_signed(origin)?;
-            ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
-            let (_, _, revokable) = Anchors::<T>::get(&anchor);
-
-            Self::deposit_event(RawEvent::AnchorRevokable(revokable));
-
-            Ok(())
-        }
-
         // revoke the anchor iff its revokable and the request account matches
         // NOTE: if we go for compiste hash key (see create_anchor), we need to add
         // block_height.
         pub fn revoke_anchor(origin, anchor: Vec<u8>) -> DispatchResult {
-
             let sender = ensure_signed(origin)?;
             ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
 
@@ -176,13 +162,21 @@ decl_module! {
             Ok(())
         }
 
-        pub fn is_leaf_revoked(origin, anchor_value: Vec<u8>, leaf_value: Vec<u8>) -> DispatchResult {
+    }
+}
 
+impl<T: Trait> Module<T> {
+    // this is for revoking the anchor not any one of the leafs and directly tied to
+    // the origin account at create time. Note: for (on-chain) merkle tree aggregation
+    // we don't allow "root" revocation.
+    pub fn is_revokable(anchor: Vec<u8>) -> Result<bool, &'static str> {
+        ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
+        let (_, _, revokable) = Anchors::<T>::get(&anchor);
+        Ok(revokable)
+    }
 
-            // Self::deposit_event(RawEvent::LeafRevoked(sender, anchor_value, leaf_value));
-
-            Ok(())
-        }
+    pub fn is_leaf_revoked(_anchor_value: Vec<u8>, _leaf_value: Vec<u8>) -> bool {
+        unimplemented!()
     }
 }
 
@@ -194,13 +188,9 @@ decl_event!(
     {
         AnchorCreated(AccountId, Vec<u8>),
         AnchorRevoked(AccountId, Vec<u8>),
-        AnchorRevokable(bool),
 
         LeafRevoked(AccountId, Vec<u8>, Vec<u8>),
         LeafSuspended(AccountId, Vec<u8>, Vec<u8>, BlockNumber),
-
-        IsLeafRevoked(AccountId, Vec<u8>, Vec<u8>),
-        IsLeafSuspended(AccountId, Vec<u8>, BlockNumber),
     }
 );
 
