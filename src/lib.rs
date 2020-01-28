@@ -1,20 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-/// A pallet template with necessary imports
-
-/// Feel free to remove or edit this file as needed.
-/// If you change the name of this file, make sure to update its references in runtime/src/lib.rs
-/// If you remove this file, you can remove those references
-
-/// For more guidance on FRAME pallets, see the example.
-/// https://github.com/paritytech/substrate/blob/master/frame/example/src/lib.rs
+use codec::Encode;
 use frame_support::{decl_event, decl_module, decl_storage, dispatch::DispatchResult};
 use frame_support::{ensure, StorageMap};
-use sp_runtime::DispatchError;
-use system::ensure_signed;
-// use sp_std::vec::Vec;
-use codec::{Decode, Encode};
 use sp_runtime::traits::Hash;
+use system::ensure_signed;
 
 // Max number of authorized accounts to operate on leaf-based revocation
 // There's got to be a
@@ -219,7 +209,7 @@ decl_event!(
 mod tests {
     use super::*;
 
-    use frame_support::{assert_ok, impl_outer_origin, parameter_types, weights::Weight};
+    use frame_support::{impl_outer_origin, parameter_types, weights::Weight};
     use sp_core::H256;
     use sp_runtime::{
         testing::Header,
@@ -263,7 +253,6 @@ mod tests {
     impl Trait for Test {
         type Event = ();
     }
-    type TemplateModule = Module<Test>;
 
     // This function basically just builds a genesis storage key/value store according to
     // our desired mockup.
