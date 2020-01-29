@@ -6,36 +6,28 @@ use frame_support::{ensure, StorageMap};
 use sp_runtime::traits::Hash;
 use system::ensure_signed;
 
+pub type UnixTimeSeconds = u64;
+
 // Max number of authorized accounts to operate on leaf-based revocation
 // There's got to be a
 pub const MAX_AUTHORIZED_ACCOUNTS: usize = 10usize;
 
-/*
-NOTE: decided to try and push that to the requester s.t. suspension end needs to be specified
-      in (chain) blocks. Requester should track telemmetry/instrumentation.
-
-Block-based time units to check whether a suspended leaf is reinstated.
-pub const MILLISECS_PER_BLOCK: u32 = 6_000u32; //Kusama-3 avg blocktime ~ 6 secs.
-pub const BLOCK_MINUTES: u32 = MILLISECS_PER_BLOCK * 10; //60k blocks @ 6s/block = 1 Minute
-pub const BLOCK_HOUR: u32 = BLOCK_MINUTES * 60;
-pub const BLOCK_DAY: u32 = BLOCK_HOUR * 24;
-*/
-
-/// The pallet's configuration trait.
+/// The output of the hash function used constructing merkel roots confugurable.\
+/// By default it is the the output specified in system::Trait.
 pub trait Trait: system::Trait {
     type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+    type MerkleHash: frame_support::Parameter + Eq;
 }
 
 // This pallet's storage items.
 decl_storage! {
     trait Store for Module<T: Trait> as TemplateModule {
-
         // Simple anchor storage for:
         // {"anchor value aaka digest": (from acct, block block height, revokable)}
         // Note:
         //         if revokable, the revocation can only come from the origin account
         //         this is different than "leaf revocation", see below !!!
-        Anchors: map Vec<u8> => (T::AccountId, T::BlockNumber, bool);
+        Anchors: map <T as Trait>::MerkleHash => (T::AccountId, T::BlockNumber, bool);
 
         // Allocating leaf revocation rights for a given anchor to accounts other than
         // origin at creation.
@@ -43,17 +35,9 @@ decl_storage! {
         // hash(accountid, block_height, anchor_value) should do !!
         AuthorizedRevokers: map T::Hash => Vec<T::AccountId>;
 
-        // Reference, aka storage, to revoked leafs, i.e., the reference data (hash) that can
-        // be looked up in lieu of a centralized revocation reference a la blockcerts.
-        // Instead of the central lookup list, the user needs to build the RPC call and then
-        // format accordingly.
-        //
-        // {"leaf digest": (from acct, current block height, anchor_digest, Optional suspension end in block height)}
-        // NOTE: we ought to streamline this into:
-        // hashed_leaf_key = Hash(leaf digest + anchor digest + anchor block height) s.t.
-        // {"key", (?)}
-        // if not a suspension, we can put it in a bloomfilter  as well and be done with it
-        RevokedLeafs: map Vec<u8> => (T::AccountId, T::BlockNumber, Vec<u8>, Option<T::BlockNumber>);
+        // A set of leaves that are suspended.
+        // Setting suspension end to u64::max() is effectively permanent revocation.
+        SuspendedLeaves: map (T::AccountId, <T as Trait>::MerkleHash) => UnixTimeSeconds;
     }
 }
 
@@ -65,12 +49,10 @@ decl_module! {
 
         pub fn create_anchor(
             origin,
-            anchor: Vec<u8>,
+            anchor: <T as Trait>::MerkleHash,
             revocable: bool,
             auth_addrs: Option<Vec<T::AccountId>>
         ) -> DispatchResult {
-            // formalize that !!
-            ensure!(!anchor.len() > 512, "Max bytes for digest values is 512");
             let sender = ensure_signed(origin)?;
 
             // NOTE: we should make the key Hash(data,block height) for a more accurate collision exclusion !!
@@ -113,7 +95,7 @@ decl_module! {
         // revoke the anchor iff its revokable and the request account matches
         // NOTE: if we go for compiste hash key (see create_anchor), we need to add
         // block_height.
-        pub fn revoke_anchor(origin, anchor: Vec<u8>) -> DispatchResult {
+        pub fn revoke_anchor(origin, anchor: <T as Trait>::MerkleHash) -> DispatchResult {
             let sender = ensure_signed(origin)?;
             ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
 
@@ -126,39 +108,28 @@ decl_module! {
             Ok(())
         }
 
-        // this is (almost) independent of the anchor since we don't have/keep leaf data on-chain
-        // and merkle proof submission don't matter.
-        pub fn revoke_leaf(
+
+        /// Revoke leaf until suspend_end. If suspend_end is in the past, this has no sematic
+        /// effect. Using u64::max() for suspend_end is practically equivalent to a permanent
+        /// revocation.
+        ///
+        /// This is independent of the anchor since we don't have/keep leaf data on-chain
+        /// and merkle proof submission don't matter.
+        pub fn suspend_leaf(
             origin,
-            anchor_value: Vec<u8>,
-            leaf_value: Vec<u8>,
-            expiration: Option<T::BlockNumber>
+            leaf_value: <T as Trait>::MerkleHash,
+            suspend_end: UnixTimeSeconds
         ) -> DispatchResult {
             let sender = ensure_signed(origin)?;
-            let current_block = <system::Module<T>>::block_number();
-
-            if expiration.is_some() {
-                let ex = expiration.unwrap();
-                ensure!(ex > current_block, "Supension must end in the future.");
-                RevokedLeafs::<T>::insert(
-                    leaf_value.clone(),
-                    (sender.clone(),current_block.clone(), anchor_value.clone(), Some(ex.clone()))
-                );
-                Self::deposit_event(RawEvent::LeafSuspended(sender, anchor_value, leaf_value, ex));
-            }
-            else {
-                RevokedLeafs::<T>::insert(
-                    leaf_value.clone(),
-                    (
-                        sender.clone(),
-                        current_block.clone(),
-                        anchor_value.clone(),
-                        None::<T::BlockNumber>
-                    )
-                );
-                Self::deposit_event(RawEvent::LeafRevoked(sender, anchor_value, leaf_value));
-            }
-
+            let key = (&sender, &leaf_value);
+            let current_suspend_end = SuspendedLeaves::<T>::get(key);
+            debug_assert!(
+                SuspendedLeaves::<T>::exists(key) || current_suspend_end == 0u64,
+                "if no suspension exists, the default is expected to be 0"
+            );
+            ensure!(suspend_end <= current_suspend_end, "leaf is already suspended until specified time");
+            SuspendedLeaves::<T>::insert(key, suspend_end);
+            Self::deposit_event(RawEvent::LeafSuspended(sender, leaf_value, suspend_end));
             Ok(())
         }
 
@@ -169,13 +140,16 @@ impl<T: Trait> Module<T> {
     // this is for revoking the anchor not any one of the leafs and directly tied to
     // the origin account at create time. Note: for (on-chain) merkle tree aggregation
     // we don't allow "root" revocation.
-    pub fn is_revokable(anchor: Vec<u8>) -> Result<bool, &'static str> {
+    pub fn is_revokable(anchor: <T as Trait>::MerkleHash) -> Result<bool, &'static str> {
         ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
         let (_, _, revokable) = Anchors::<T>::get(&anchor);
         Ok(revokable)
     }
 
-    pub fn is_leaf_revoked(_anchor_value: Vec<u8>, _leaf_value: Vec<u8>) -> bool {
+    pub fn is_leaf_revoked(
+        _anchor_value: <T as Trait>::MerkleHash,
+        _leaf_value: <T as Trait>::MerkleHash,
+    ) -> bool {
         unimplemented!()
     }
 }
@@ -184,13 +158,11 @@ decl_event!(
     pub enum Event<T>
     where
         <T as system::Trait>::AccountId,
-        <T as system::Trait>::BlockNumber,
+        <T as Trait>::MerkleHash,
     {
-        AnchorCreated(AccountId, Vec<u8>),
-        AnchorRevoked(AccountId, Vec<u8>),
-
-        LeafRevoked(AccountId, Vec<u8>, Vec<u8>),
-        LeafSuspended(AccountId, Vec<u8>, Vec<u8>, BlockNumber),
+        AnchorCreated(AccountId, MerkleHash),
+        AnchorRevoked(AccountId, MerkleHash),
+        LeafSuspended(AccountId, MerkleHash, UnixTimeSeconds),
     }
 );
 
@@ -242,6 +214,7 @@ mod tests {
     }
     impl Trait for Test {
         type Event = ();
+        type MerkleHash = [u8; 32];
     }
 
     // This function basically just builds a genesis storage key/value store according to
