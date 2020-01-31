@@ -1,168 +1,161 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use codec::Encode;
-use frame_support::{decl_event, decl_module, decl_storage, dispatch::DispatchResult};
-use frame_support::{ensure, StorageMap};
-use sp_runtime::traits::Hash;
-use system::ensure_signed;
+pub mod hasher;
+pub mod merkle;
 
-pub type UnixTimeSeconds = u64;
+use crate::hasher::Hasher;
+use crate::merkle::{verify_proof, Hashed, MerkleRoot, ProofElement};
+use codec::{Decode, Encode};
+use frame_support::{
+    decl_event, decl_module, decl_storage, dispatch::DispatchResult, ensure, StorageMap,
+};
+use system::ensure_signed;
 
 // Max number of authorized accounts to operate on leaf-based revocation
 // There's got to be a
-pub const MAX_AUTHORIZED_ACCOUNTS: usize = 10usize;
+pub const MAX_AUTHORIZED_ACCOUNTS: u8 = 10u8;
 
-/// The output of the hash function used constructing merkel roots confugurable.\
+/// The output of the hash function used constructing merkle roots configurable.\
 /// By default it is the the output specified in system::Trait.
 pub trait Trait: system::Trait {
     type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
-    type MerkleHash: frame_support::Parameter + Eq;
+    /// The hash function used when constructing and verifying Merkle proofs.
+    type TreeHash: Hasher<Output = [u8; 32]>;
+
+    /// hash Self::AccountId using Self::Treehash
+    fn account_id_hash(account: &Self::AccountId) -> <<Self as Trait>::TreeHash as Hasher>::Output;
 }
 
-// This pallet's storage items.
+pub struct Document;
+pub type UnixTimeSeconds = u64;
+#[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
+enum Revokable<T> {
+    NotRevoked(T),
+    Revoked,
+}
+
 decl_storage! {
     trait Store for Module<T: Trait> as TemplateModule {
-        // Simple anchor storage for:
-        // {"anchor value aaka digest": (from acct, block block height, revokable)}
-        // Note:
-        //         if revokable, the revocation can only come from the origin account
-        //         this is different than "leaf revocation", see below !!!
-        Anchors: map <T as Trait>::MerkleHash => (T::AccountId, T::BlockNumber, bool);
+        /// Immutable anchors. Once inserted, they cannot be removed.
+        Anchors: map MerkleRoot<Document, T::TreeHash> => Option<T::BlockNumber>;
 
-        // Allocating leaf revocation rights for a given anchor to accounts other than
-        // origin at creation.
-        // NOTE: we should change that to a bloom filter where
-        // hash(accountid, block_height, anchor_value) should do !!
-        AuthorizedRevokers: map T::Hash => Vec<T::AccountId>;
+        /// Scoping Anchors to the parties with revocation permission prevents frontrunning
+        /// attacks.
+        /// When a party proves their membership in "Administrators", they may revoke this anchor.
+        RevocableAnchors: map (
+            MerkleRoot<T::AccountId, T::TreeHash>, // Administrators
+            MerkleRoot<Document, T::TreeHash>
+        ) => Option<Revokable<T::BlockNumber>>;
 
-        // A set of leaves that are suspended.
-        // Setting suspension end to u64::max() is effectively permanent revocation.
-        SuspendedLeaves: map (T::AccountId, <T as Trait>::MerkleHash) => UnixTimeSeconds;
+        /// Suspensions mapped to suspension expiration.
+        /// Setting suspension expiration to u64::max() is a permanent revocation.
+        /// A party needs to prove their membership in "Administrators" in order to issue a
+        /// suspension.
+        SuspendedLeaves: map (
+            MerkleRoot<T::AccountId, T::TreeHash>, // Administrators
+            Hashed<Document, T::TreeHash>
+        ) => Option<UnixTimeSeconds>;
     }
 }
 
-// The pallet's dispatchable functions.
 decl_module! {
     pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-
         fn deposit_event() = default;
 
-        pub fn create_anchor(
+        fn create_anchor(_origin, root: MerkleRoot<Document, T::TreeHash>) -> DispatchResult {
+            debug_assert!(Anchors::<T>::exists(&root) || Anchors::<T>::get(&root) == None);
+            ensure!(!Anchors::<T>::exists(&root), "The root is already anchored.");
+            Anchors::<T>::insert(&root, <system::Module<T>>::block_number());
+            Ok(())
+        }
+
+        fn create_revocable_anchor(
+            _origin,
+            admins: MerkleRoot<T::AccountId, T::TreeHash>,
+            root: MerkleRoot<Document, T::TreeHash>
+        ) -> DispatchResult {
+            let key = (admins, root.clone());
+            debug_assert!( // todo: move this to a test
+                RevocableAnchors::<T>::exists(&key) || RevocableAnchors::<T>::get(&key) == None
+            );
+            ensure!(!RevocableAnchors::<T>::exists(&key), "The root has already been anchored.");
+            RevocableAnchors::<T>::insert(
+                &key,
+                Revokable::NotRevoked(<system::Module<T>>::block_number()),
+            );
+            Ok(())
+        }
+
+        /// An anchor can be revoked even before it is posted.
+        fn revoke_anchor(
             origin,
-            anchor: <T as Trait>::MerkleHash,
-            revocable: bool,
-            auth_addrs: Option<Vec<T::AccountId>>
+            admins: MerkleRoot<T::AccountId, T::TreeHash>,
+            root: MerkleRoot<Document, T::TreeHash>,
+            proof: Vec<ProofElement<T::TreeHash>>,
         ) -> DispatchResult {
             let sender = ensure_signed(origin)?;
-
-            // NOTE: we should make the key Hash(data,block height) for a more accurate collision exclusion !!
-            ensure!(!Anchors::<T>::exists(&anchor), "This anchor digest has already been claimed.");
-
-            // we don't want some endless account list here and need the RPC to enforce that first and foremost
-            let addrs = match auth_addrs {
-                Some(a) => a,
-                _ => Vec::<T::AccountId>::new(),
-            };
-            ensure!(
-                addrs.len() <= MAX_AUTHORIZED_ACCOUNTS,
-                "Exceeding allowable number of addresses"
-            );
-
-            let current_block = <system::Module<T>>::block_number();
-
-            // if we have authorized AccountIds, add them to storage
-            if addrs.len() > 0 {
-                let key_hash = (anchor.clone(), current_block.clone())
-                    .using_encoded(<T as system::Trait>::Hashing::hash);
-                /*
-                let key_hash = blake2::new()
-                                .chain(&anchor)
-                                .chain(&current_block)
-                                .finalize()
-                                .result();
-                */
-                AuthorizedRevokers::<T>::insert(&key_hash, addrs);
-                // need an event notification for that?
-            }
-
-            // anchor reference to storage
-            Anchors::<T>::insert(&anchor, (sender.clone(), current_block, revocable));
-            Self::deposit_event(RawEvent::AnchorCreated(sender, anchor));
-
+            let valid = verify_proof(&admins, &proof, &T::account_id_hash(&sender));
+            ensure!(valid, "invalid proof");
+            RevocableAnchors::<T>::insert((admins, root), Revokable::Revoked);
             Ok(())
         }
 
-        // revoke the anchor iff its revokable and the request account matches
-        // NOTE: if we go for compiste hash key (see create_anchor), we need to add
-        // block_height.
-        pub fn revoke_anchor(origin, anchor: <T as Trait>::MerkleHash) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
-            ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
-
-            let (acct_id, _, revokable) = Anchors::<T>::get(&anchor);
-            ensure!(revokable, "Anchor is not revocable");
-            ensure!(sender==acct_id, "Requester is not the owner of the anchor.");
-
-            Self::deposit_event(RawEvent::AnchorRevoked(sender, anchor));
-
-            Ok(())
-        }
-
-
-        /// Revoke leaf until suspend_end. If suspend_end is in the past, this has no sematic
-        /// effect. Using u64::max() for suspend_end is practically equivalent to a permanent
-        /// revocation.
+        /// revoke leaf until suspend_end. If suspend_end is in the past, this has no sematic
+        /// effect. Using u64::max() for suspend_end is a permanent revocation.
         ///
         /// This is independent of the anchor since we don't have/keep leaf data on-chain
-        /// and merkle proof submission don't matter.
+        /// and merkle proof submission doesn't matter.
         pub fn suspend_leaf(
             origin,
-            leaf_value: <T as Trait>::MerkleHash,
-            suspend_end: UnixTimeSeconds
+            proof: Vec<ProofElement<T::TreeHash>>,
+            admins: MerkleRoot<T::AccountId, T::TreeHash>,
+            leaf_value: Hashed<Document, T::TreeHash>,
+            suspend_end: UnixTimeSeconds,
         ) -> DispatchResult {
             let sender = ensure_signed(origin)?;
-            let key = (&sender, &leaf_value);
-            let current_suspend_end = SuspendedLeaves::<T>::get(key);
-            debug_assert!(
-                SuspendedLeaves::<T>::exists(key) || current_suspend_end == 0u64,
-                "if no suspension exists, the default is expected to be 0"
+            let key = (admins.clone(), leaf_value);
+            let current_suspend_end = SuspendedLeaves::<T>::get(&key);
+            debug_assert!( // todo: move this to a test
+                SuspendedLeaves::<T>::exists(&key) || current_suspend_end == None,
+                "if no suspension exists, the default is expected to be None"
             );
-            ensure!(suspend_end <= current_suspend_end, "leaf is already suspended until specified time");
+            match current_suspend_end {
+                Some(end) => ensure!(suspend_end <= end, "leaf is already suspended until specified time"),
+                None => {}
+            }
+            let valid = verify_proof(&admins, &proof, &T::account_id_hash(&sender));
+            ensure!(valid, "invalid proof");
             SuspendedLeaves::<T>::insert(key, suspend_end);
-            Self::deposit_event(RawEvent::LeafSuspended(sender, leaf_value, suspend_end));
             Ok(())
         }
-
     }
 }
 
 impl<T: Trait> Module<T> {
-    // this is for revoking the anchor not any one of the leafs and directly tied to
-    // the origin account at create time. Note: for (on-chain) merkle tree aggregation
-    // we don't allow "root" revocation.
-    pub fn is_revokable(anchor: <T as Trait>::MerkleHash) -> Result<bool, &'static str> {
-        ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
-        let (_, _, revokable) = Anchors::<T>::get(&anchor);
-        Ok(revokable)
-    }
+    // // this is for revoking the anchor not any one of the leafs and directly tied to
+    // // the origin account at create time. Note: for (on-chain) merkle tree aggregation
+    // // we don't allow "root" revocation.
+    // pub fn is_revokable(_anchor: <T as Trait>::MerkleHash) -> Result<bool, &'static str> {
+    //     unimplemented!()
+    //     // ensure!(Anchors::<T>::exists(&anchor), "This anchor does not exist.");
+    //     // let (_, _, revokable) = Anchors::<T>::get(&anchor);
+    //     // Ok(revokable)
+    // }
 
-    pub fn is_leaf_revoked(
-        _anchor_value: <T as Trait>::MerkleHash,
-        _leaf_value: <T as Trait>::MerkleHash,
-    ) -> bool {
-        unimplemented!()
-    }
+    // pub fn is_leaf_revoked(
+    //     _anchor_value: <T as Trait>::MerkleHash,
+    //     _leaf_value: <T as Trait>::MerkleHash,
+    // ) -> bool {
+    //     unimplemented!()
+    // }
 }
 
 decl_event!(
     pub enum Event<T>
     where
         <T as system::Trait>::AccountId,
-        <T as Trait>::MerkleHash,
     {
-        AnchorCreated(AccountId, MerkleHash),
-        AnchorRevoked(AccountId, MerkleHash),
-        LeafSuspended(AccountId, MerkleHash, UnixTimeSeconds),
+        Dummy(AccountId),
     }
 );
 
@@ -214,7 +207,10 @@ mod tests {
     }
     impl Trait for Test {
         type Event = ();
-        type MerkleHash = [u8; 32];
+        type TreeHash = blake2::Blake2s;
+        fn account_id_hash(account_id: &u64) -> [u8; 32] {
+            Self::TreeHash::hash(&[&account_id.to_be_bytes()])
+        }
     }
 
     // This function basically just builds a genesis storage key/value store according to
