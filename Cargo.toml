@@ -62,3 +62,6 @@ version = '0.8.1'
 
 [dependencies.derivative]
 version = "1.0.3"
+
+[dev-dependencies]
+hex-literal = "0.2.1"
