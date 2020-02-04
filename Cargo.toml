@@ -51,8 +51,19 @@ git = 'https://github.com/paritytech/substrate.git'
 rev = '3e651110aa06aa835790df63410a29676243fc54'
 version = '2.0.0'
 
-[dev-dependencies.sp-core]
+[dependencies.sp-core]
 default-features = false
 git = 'https://github.com/paritytech/substrate.git'
 rev = '3e651110aa06aa835790df63410a29676243fc54'
 version = '2.0.0'
+
+[dependencies.blake2]
+version = '0.8.1'
+
+[dependencies.derivative]
+version = "1.0.3"
+
+[dev-dependencies]
+hex-literal = "0.2.1"
+rand = "0.7.3"
+sha2 = '0.8.1'
